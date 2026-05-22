@@ -345,7 +345,8 @@ def init_agent(
     # (api.openai.com) since all newer tool-calling models prefer
     # Responses there. ACP runtimes are excluded: CopilotACPClient
     # handles its own routing and does not implement the Responses API
-    # surface.
+    # surface. Claude CLI also exposes a chat-completion-shaped local
+    # facade but no Responses API surface.
     # When api_mode was explicitly provided, respect it — the user
     # knows what their endpoint supports (#10473).
     # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
@@ -354,9 +355,10 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
+        and agent.provider not in {"copilot-acp", "claude-cli"}
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
+        and not str(agent.base_url or "").lower().startswith("claude-cli://")
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -708,7 +710,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            if agent.provider in {"copilot-acp", "claude-cli"}:
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
