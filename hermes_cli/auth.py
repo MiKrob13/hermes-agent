@@ -3138,6 +3138,44 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _dual_file_oat_read_enabled() -> bool:
+    """Feature flag for adopting fresher Codex CLI tokens from ~/.codex/auth.json.
+
+    Default off. When enabled, Hermes peeks at ``~/.codex/auth.json`` before
+    refreshing its own token; if the Codex CLI file holds a strictly fresher
+    access_token (later JWT ``exp``), Hermes adopts it instead of firing a
+    refresh POST. Designed for shared-host setups where Hermes + OpenClaw +
+    Codex CLI all consume the same ChatGPT subscription OAT.
+    """
+    return is_truthy_value(os.getenv("HERMES_DUAL_FILE_OAT_READ"), default=False)
+
+
+def _codex_token_exp(access_token):
+    claims = _decode_jwt_claims(access_token)
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    return None
+
+
+def _codex_token_strictly_fresher(
+    candidate,
+    baseline,
+    *,
+    min_remaining_seconds: int,
+) -> bool:
+    """Return True iff candidate's exp > baseline's exp AND candidate has at
+    least ``min_remaining_seconds`` of life left. Prevents adopting a token
+    that's also about to expire (avoids ping-ponging into a refresh anyway)."""
+    cand_exp = _codex_token_exp(candidate)
+    base_exp = _codex_token_exp(baseline)
+    if cand_exp is None or base_exp is None:
+        return False
+    if cand_exp <= base_exp:
+        return False
+    return cand_exp > (time.time() + max(0, int(min_remaining_seconds)))
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -3163,6 +3201,23 @@ def resolve_codex_runtime_credentials(
             should_refresh = bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+
+            if should_refresh and _dual_file_oat_read_enabled():
+                external = _import_codex_cli_tokens()
+                if external and _codex_token_strictly_fresher(
+                    external.get("access_token"),
+                    access_token,
+                    min_remaining_seconds=refresh_skew_seconds,
+                ):
+                    tokens = dict(external)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
+                    _save_codex_tokens(tokens)
+                    data = _read_codex_tokens(_lock=False)
+                    should_refresh = False
+                    logger.info(
+                        "codex auth: adopted fresher tokens from ~/.codex/auth.json "
+                        "(dual-file OAT read)",
+                    )
 
             if should_refresh:
                 tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)

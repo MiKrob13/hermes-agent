@@ -351,3 +351,156 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+
+
+# ---------------------------------------------------------------------------
+# Dual-file OAT read (HERMES_DUAL_FILE_OAT_READ flag)
+# ---------------------------------------------------------------------------
+
+def _setup_codex_cli_auth(codex_home: Path, *, access_token: str, refresh_token: str = "cli-refresh"):
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": access_token, "refresh_token": refresh_token},
+    }))
+
+
+def test_dual_file_oat_disabled_ignores_fresher_external(tmp_path, monkeypatch):
+    """Flag off: even if Codex CLI has a fresher token, Hermes refreshes its own."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresher = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(hermes_home, access_token=expiring, refresh_token="refresh-old")
+    _setup_codex_cli_auth(codex_home, access_token=fresher)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.delenv("HERMES_DUAL_FILE_OAT_READ", raising=False)
+
+    called = {"count": 0}
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "refreshed-via-post", "refresh_token": "refresh-new"}
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 1, "refresh must fire when flag is off"
+    assert resolved["api_key"] == "refreshed-via-post"
+
+
+def test_dual_file_oat_enabled_adopts_fresher_external(tmp_path, monkeypatch):
+    """Flag on + Codex CLI has fresher token → adopt, no refresh."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresher = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(hermes_home, access_token=expiring, refresh_token="refresh-old")
+    _setup_codex_cli_auth(codex_home, access_token=fresher)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HERMES_DUAL_FILE_OAT_READ", "1")
+
+    called = {"count": 0}
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "should-not-be-called", "refresh_token": "x"}
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 0, "refresh must NOT fire when external is adopted"
+    assert resolved["api_key"] == fresher
+
+
+def test_dual_file_oat_enabled_ignores_older_external(tmp_path, monkeypatch):
+    """Flag on but Codex CLI token is older → fall through to refresh."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    even_older = _jwt_with_exp(int(time.time()) - 3600)
+    _setup_hermes_auth(hermes_home, access_token=expiring, refresh_token="refresh-old")
+    _setup_codex_cli_auth(codex_home, access_token=even_older)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HERMES_DUAL_FILE_OAT_READ", "1")
+
+    called = {"count": 0}
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "refreshed-via-post", "refresh_token": "refresh-new"}
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 1, "refresh must fire when external is not strictly fresher"
+    assert resolved["api_key"] == "refreshed-via-post"
+
+
+def test_dual_file_oat_enabled_no_external_file(tmp_path, monkeypatch):
+    """Flag on but ~/.codex/auth.json doesn't exist → fall through to refresh."""
+    hermes_home = tmp_path / "hermes"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(hermes_home, access_token=expiring, refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent-codex"))
+    monkeypatch.setenv("HERMES_DUAL_FILE_OAT_READ", "1")
+
+    called = {"count": 0}
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "refreshed-via-post", "refresh_token": "refresh-new"}
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 1, "refresh must fire when no external file"
+    assert resolved["api_key"] == "refreshed-via-post"
+
+
+def test_dual_file_oat_enabled_ignores_near_expired_external(tmp_path, monkeypatch):
+    """Flag on, external is fresher than Hermes but itself near expiry → no adoption.
+
+    Prevents ping-ponging: don't adopt a token that's about to need refresh anyway.
+    """
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    expired = _jwt_with_exp(int(time.time()) - 100)
+    # External is fresher than expired but has only 5s of life left — well under
+    # the default refresh skew window — so should NOT be adopted.
+    near_expired = _jwt_with_exp(int(time.time()) + 5)
+    _setup_hermes_auth(hermes_home, access_token=expired, refresh_token="refresh-old")
+    _setup_codex_cli_auth(codex_home, access_token=near_expired)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HERMES_DUAL_FILE_OAT_READ", "1")
+
+    called = {"count": 0}
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "refreshed-via-post", "refresh_token": "refresh-new"}
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 1, "refresh must fire when external is also near-expired"
+    assert resolved["api_key"] == "refreshed-via-post"
+
+
+def test_dual_file_oat_adoption_persists_to_hermes_store(tmp_path, monkeypatch):
+    """After adopting external tokens, next read from Hermes store sees them."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresher = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(hermes_home, access_token=expiring, refresh_token="refresh-old")
+    _setup_codex_cli_auth(codex_home, access_token=fresher, refresh_token="cli-refresh-xyz")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HERMES_DUAL_FILE_OAT_READ", "1")
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AssertionError("refresh must not be called")
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolve_codex_runtime_credentials()
+
+    # Hermes auth store should now contain the adopted tokens
+    data = _read_codex_tokens()
+    assert data["tokens"]["access_token"] == fresher
+    assert data["tokens"]["refresh_token"] == "cli-refresh-xyz"
+
