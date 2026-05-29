@@ -176,6 +176,8 @@ You can configure the gateway to receive cross-profile Kanban task notifications
 
 **Task state can change between dispatch and your startup.** Between when the dispatcher claimed and when your process actually booted, the task may have been blocked, reassigned, or archived. Always `kanban_show` first. If it reports `blocked` or `archived`, stop — you shouldn't be running.
 
+**Task state can also change MID-RUN, not just at startup.** While you're working, the operator (or another worker) can archive the task. The signal: `kanban_complete` / `kanban_block` / `kanban_heartbeat` returns `"could not complete <id> (unknown id or already terminal)"` — same error shape you'd get from a typo in the id. Diagnose by re-reading the task's event log (`kanban_show` and inspect `events`) for a `kind: "archived"` entry; if present, your completion was correctly rejected because the card was terminalized externally. Do NOT keep retrying. On-disk artifacts you wrote to the workspace are still valid — just report status to the user in your final text response (path + summary line) and stop. This is distinct from the retry-diagnostic case in `runs[].outcome` which only fires on the *next* spawn.
+
 **Workspace may have stale artifacts.** Especially `dir:` and `worktree` workspaces can have files from previous runs. Read the comment thread — it usually explains why you're running again and what state the workspace is in.
 
 **Don't rely on the CLI when the guidance is available.** The `kanban_*` tools work across all terminal backends (Docker, Modal, SSH). `hermes kanban <verb>` from your terminal tool will fail in containerized backends because the CLI isn't installed there. When in doubt, use the tool.
