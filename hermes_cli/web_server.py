@@ -132,11 +132,11 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 # on every server start. Either way it dies when the process exits and is
 # injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
-<<<<<<< Updated upstream
-_SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
-=======
-_SESSION_TOKEN = os.getenv("HERMES_DASHBOARD_TOKEN") or secrets.token_urlsafe(32)
->>>>>>> Stashed changes
+_SESSION_TOKEN = (
+    os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+    or os.environ.get("HERMES_DASHBOARD_TOKEN")
+    or secrets.token_urlsafe(32)
+)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
