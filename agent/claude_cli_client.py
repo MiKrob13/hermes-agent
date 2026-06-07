@@ -61,7 +61,29 @@ def _coerce_timeout(timeout: Any) -> float:
     return max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
 
-def _ensure_print_args(args: list[str], model: str | None) -> list[str]:
+def _effort_from_payload(*payloads: Any) -> str | None:
+    """Extract Hermes/OpenAI-shaped reasoning effort for Claude CLI."""
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        reasoning = payload
+        if "effort" not in reasoning:
+            reasoning = payload.get("reasoning") or payload.get("reasoning_config")
+        if not isinstance(reasoning, dict):
+            continue
+        if reasoning.get("enabled") is False:
+            return None
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            effort = effort.strip().lower()
+            if effort == "minimal":
+                return "low"
+            if effort in {"low", "medium", "high", "xhigh", "max"}:
+                return effort
+    return None
+
+
+def _ensure_print_args(args: list[str], model: str | None, effort: str | None = None) -> list[str]:
     final = list(args)
     if "--print" not in final and "-p" not in final:
         final.insert(0, "--print")
@@ -71,6 +93,8 @@ def _ensure_print_args(args: list[str], model: str | None) -> list[str]:
         final.append("--no-session-persistence")
     if model and "--model" not in final:
         final.extend(["--model", model])
+    if effort and "--effort" not in final:
+        final.extend(["--effort", effort])
     return final
 
 
@@ -168,6 +192,9 @@ class ClaudeCLIClient:
         timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
+        reasoning: dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
         **_: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
@@ -176,7 +203,8 @@ class ClaudeCLIClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        cmd = [self._command] + _ensure_print_args(self._args, model)
+        effort = _effort_from_payload(reasoning, reasoning_config, extra_body)
+        cmd = [self._command] + _ensure_print_args(self._args, model, effort)
         try:
             completed = subprocess.run(
                 cmd,

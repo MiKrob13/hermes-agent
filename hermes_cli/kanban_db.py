@@ -6681,6 +6681,46 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Parent gateway processes may carry a stale HERMES_MAX_ITERATIONS from
+    # their own startup env. If copied through unchanged, it silently shadows
+    # the assignee profile's agent.max_turns and project-class Kanban workers
+    # hit the default 90-turn wall even when the profile is configured higher.
+    # Read the spawned profile config directly and raise only when the profile
+    # asks for a larger budget, preserving intentional low env caps.
+    try:
+        import yaml as _yaml_worker_budget
+
+        _cfg_path = Path(env.get("HERMES_HOME", "")) / "config.yaml"
+        if _cfg_path.exists():
+            _raw_cfg = _yaml_worker_budget.safe_load(_cfg_path.read_text(encoding="utf-8")) or {}
+            _agent_cfg = _raw_cfg.get("agent", {}) if isinstance(_raw_cfg, dict) else {}
+            _profile_max = None
+            if isinstance(_agent_cfg, dict):
+                _profile_max = _agent_cfg.get("max_turns")
+            if _profile_max is None and isinstance(_raw_cfg, dict):
+                _profile_max = _raw_cfg.get("max_turns")
+            if _profile_max is not None:
+                _profile_max_i = int(_profile_max)
+                try:
+                    _current_max_i = int(str(env.get("HERMES_MAX_ITERATIONS", "") or "0"))
+                except (TypeError, ValueError):
+                    _current_max_i = 0
+                if _profile_max_i > _current_max_i:
+                    env["HERMES_MAX_ITERATIONS"] = str(_profile_max_i)
+
+            _model_cfg = _raw_cfg.get("model", {}) if isinstance(_raw_cfg, dict) else {}
+            _provider = ""
+            if isinstance(_model_cfg, dict):
+                _provider = str(_model_cfg.get("provider") or "").strip().lower()
+            if _provider == "openai-codex":
+                # Codex subscription auth must not inherit a metered OpenAI API
+                # key from the gateway/default profile. Keep profile-local .env
+                # as the only place credentials can intentionally appear.
+                env.pop("OPENAI_API_KEY", None)
+                env.pop("OPENAI_BASE_URL", None)
+    except Exception:
+        pass
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,

@@ -72,6 +72,33 @@ def test_claude_cli_client_invokes_print_json(monkeypatch, tmp_path):
     assert response.usage.completion_tokens == 4
 
 
+def test_claude_cli_client_passes_reasoning_effort(monkeypatch, tmp_path):
+    from agent.claude_cli_client import ClaudeCLIClient
+
+    calls = []
+
+    class _Completed:
+        returncode = 0
+        stdout = '{"result":"ok"}'
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _Completed()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    client = ClaudeCLIClient(command="claude", args=["--print"], cwd=str(tmp_path))
+    client.chat.completions.create(
+        model="claude-opus-4-7",
+        messages=[{"role": "user", "content": "Say ok"}],
+        reasoning_config={"enabled": True, "effort": "high"},
+    )
+
+    cmd, _kwargs = calls[0]
+    assert cmd[-4:] == ["--model", "claude-opus-4-7", "--effort", "high"]
+
+
 def test_claude_cli_client_extracts_tool_calls(monkeypatch, tmp_path):
     from agent.claude_cli_client import ClaudeCLIClient
 
