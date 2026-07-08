@@ -388,6 +388,21 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
     "localhost", "127.0.0.1", "::1",
 })
 
+# Explicit operator allowlist for trusted reverse-proxy hostnames. When the
+# dashboard is bound to loopback but reached through a trusted proxy (e.g.
+# Tailscale serve terminating :9120 -> 127.0.0.1:9119), the forwarded Host
+# header is the tailnet name, not a loopback alias, so the DNS-rebinding
+# guard would reject it. Listing the specific known hostname here restores
+# that path WITHOUT the blanket "accept any Host" behaviour of a 0.0.0.0
+# bind: only these exact names are trusted, arbitrary rebinding domains
+# still get a 400. Set HERMES_DASHBOARD_ALLOWED_HOSTS to a comma-separated
+# list of hostnames (no port).
+_EXTRA_ALLOWED_HOSTS: frozenset = frozenset(
+    h.strip().lower()
+    for h in os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "").split(",")
+    if h.strip()
+)
+
 
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """Return True iff the dashboard auth gate must be active.
@@ -439,6 +454,12 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     else:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
+
+    # Trusted reverse-proxy hostnames explicitly allowlisted by the operator
+    # via HERMES_DASHBOARD_ALLOWED_HOSTS. Checked before the bind-host logic
+    # so it works for loopback binds fronted by a proxy (Tailscale serve).
+    if host_only in _EXTRA_ALLOWED_HOSTS:
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
