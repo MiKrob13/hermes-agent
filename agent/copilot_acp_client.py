@@ -140,12 +140,25 @@ def _format_messages_as_prompt(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
 ) -> str:
-    sections: list[str] = [
-        "You are being used as the active ACP agent backend for Hermes.",
-        "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
-    ]
+    # The ACP-backend + "emit <tool_call> in OpenAI function-call shape" preamble
+    # is only meaningful when the model is actually offered tools. Emitting it on
+    # a tool-less advisory call (e.g. a MoA reference model, whose own framing says
+    # it cannot call tools and produces private guidance for a separate aggregator)
+    # combines "you are a backend for another agent system" with "your output feeds
+    # another model" — a pattern Claude Code's Usage-Policy guardrail refuses as
+    # model-output duplication. Gate it on tools so tool-less reference/auxiliary
+    # calls stay clean and are not falsely blocked.
+    has_tools = isinstance(tools, list) and bool(tools)
+    sections: list[str] = []
+    if has_tools:
+        sections.extend(
+            [
+                "You are being used as the active ACP agent backend for Hermes.",
+                "Use ACP capabilities to complete tasks.",
+                "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+                "If no tool is needed, answer normally.",
+            ]
+        )
     if model:
         sections.append(f"Hermes requested model hint: {model}")
 
