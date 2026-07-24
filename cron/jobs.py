@@ -816,15 +816,20 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     (both fresh) — a ticker stuck failing every tick would otherwise keep the
     plain heartbeat fresh and falsely report healthy (#32612, #32895).
 
+    Resolution uses ``_current_cron_store()`` so the heartbeat is correctly
+    scoped to the active profile's store — critical under multiplex_profiles
+    where each profile needs its own liveness signal (#69377).
+
     Best-effort: a write failure must never disrupt the tick loop.
     """
+    store = _current_cron_store()
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(store.cron_dir / "ticker_last_success")
         except Exception:
             pass
 
@@ -842,13 +847,24 @@ def get_ticker_heartbeat_age() -> Optional[float]:
 
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
+
+    Resolution uses ``_current_cron_store()`` so the heartbeat is correctly
+    scoped to the active profile — critical under multiplex_profiles where
+    ``hermes cron status`` must report per-profile liveness (#69377).
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    store = _current_cron_store()
+    return _epoch_file_age(store.cron_dir / "ticker_heartbeat")
 
 
 def get_ticker_success_age() -> Optional[float]:
-    """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    """Seconds since the ticker last completed a tick WITHOUT raising, or None.
+
+    Resolution uses ``_current_cron_store()`` so the heartbeat is correctly
+    scoped to the active profile — critical under multiplex_profiles where
+    ``hermes cron status`` must report per-profile liveness (#69377).
+    """
+    store = _current_cron_store()
+    return _epoch_file_age(store.cron_dir / "ticker_last_success")
 
 
 # =============================================================================
@@ -865,13 +881,16 @@ def load_jobs() -> List[Dict[str, Any]]:
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(jobs_file, 'r', encoding='utf-8') as f:
+        # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
+        # write a leading BOM; json.load under plain utf-8 raises
+        # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
+        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(jobs_file, 'r', encoding='utf-8') as f:
+            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
