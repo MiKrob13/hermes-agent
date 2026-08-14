@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         emit_json({"error": f"Workflow not found: {args.workflow}"})
         return 1
     try:
-        with wf_path.open() as f:
+        with wf_path.open(encoding="utf-8-sig") as f:
             workflow = unwrap_workflow(json.load(f))
     except (ValueError, json.JSONDecodeError) as e:
         emit_json({"error": str(e)})
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     sources: dict[str, str] = {}
     if args.models_from_file:
         try:
-            sources = json.loads(Path(args.models_from_file).read_text())
+            sources = json.loads(Path(args.models_from_file).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             log(f"Could not read --models-from-file: {e}")
 
