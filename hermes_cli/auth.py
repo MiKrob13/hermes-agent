@@ -403,6 +403,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Anthropic",
         auth_type="api_key",
         inference_base_url="https://api.anthropic.com",
+        # CLAUDE_CODE_OAUTH_TOKEN is NOT an API key, despite auth_type="api_key"
+        # and its place in this tuple (#82154). `claude setup-token` yields an
+        # `sk-ant-oat01…` OAuth token: sent as `x-api-key` it 401s, and sent as a
+        # bare Bearer it 429s. It is listed here because this tuple doubles as the
+        # credential-DISCOVERY list (agent/credential_pool.py builds its env scan
+        # from it), so removing it would stop Hermes finding a setup-token
+        # credential at all. The adapter routes such a value down the OAuth path
+        # on the strength of its prefix, not on this entry. Only ANTHROPIC_API_KEY
+        # and ANTHROPIC_TOKEN are usable as literal API keys.
         api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
         base_url_env_var="ANTHROPIC_BASE_URL",
     ),
@@ -482,6 +491,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://opencode.ai/zen/go/v1",
         api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
+    ),
+    "opencode-free": ProviderConfig(
+        id="opencode-free",
+        name="OpenCode Free",
+        auth_type="api_key",
+        inference_base_url="https://opencode.ai/zen/v1",
+        # Deliberately NO api_key_env_vars: the free tier is served
+        # anonymously (any unrecognized bearer is a 401), so there is no
+        # secret to configure. Select via `hermes model` / `/model free`.
+        api_key_env_vars=(),
     ),
     "kilocode": ProviderConfig(
         id="kilocode",
@@ -1102,34 +1121,52 @@ def _load_global_auth_store() -> Dict[str, Any]:
     Returns an empty dict when no global fallback exists (classic mode,
     or the global auth.json is absent). Never raises on missing file.
 
-    Seat belt: under pytest, refuses to read the real user's
-    ``~/.hermes/auth.json`` even when HERMES_HOME is set to a profile
-    path. The hermetic conftest does not redirect ``HOME``, so
-    ``get_default_hermes_root()`` for a profile-shaped HERMES_HOME can
-    still resolve to the real user's home on a dev machine. That would
-    leak real credentials into tests. This guard uses the unmodified
-    ``HOME`` env var (what ``os.path.expanduser('~')`` would resolve to),
-    not ``Path.home()``, because ``Path.home`` is sometimes monkeypatched
-    by fixtures that want to relocate the global root to a tmp path.
+    Memoised keyed on the global auth file's path + mtime (same pattern as
+    ``_nous_auth_status_cache``): read_credential_pool() -> load_pool() runs
+    this once per provider row in the /model picker, and the path resolution
+    (``_global_auth_file_path()`` -> ``get_default_hermes_root()``) + JSON
+    parse cost ~105us+ per call even when nothing changed. The global
+    store only changes when the user authenticates at global scope (writes
+    always go through _save_auth_store, which touches the file), so the mtime
+    key keeps the memo freshness-correct. Callers must treat the returned
+    store as read-only (all current callers do — .get / dict() / list()
+    copies only).
     """
+    global _global_auth_store_cache
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
+        _global_auth_store_cache = None
         return {}
+    try:
+        resolved_path = str(global_path.resolve(strict=False))
+        mtime_ns = global_path.stat().st_mtime_ns
+        cache_key: Optional[Tuple[str, int]] = (resolved_path, mtime_ns)
+    except Exception:
+        cache_key = None
+    if cache_key is not None and _global_auth_store_cache is not None:
+        cached_path, cached_mtime, cached_store = _global_auth_store_cache
+        if cached_path == cache_key[0] and cached_mtime == cache_key[1]:
+            return cached_store
     if os.environ.get("PYTEST_CURRENT_TEST"):
         real_home_env = os.environ.get("HOME", "")
         if real_home_env:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
                 if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    _global_auth_store_cache = None
                     return {}
             except Exception:
                 pass
     try:
-        return _load_auth_store(global_path)
+        store = _load_auth_store(global_path)
     except Exception:
         # A malformed global store must not break profile reads. The
         # profile's own auth store is still authoritative.
+        _global_auth_store_cache = None
         return {}
+    if cache_key is not None:
+        _global_auth_store_cache = (cache_key[0], cache_key[1], store)
+    return store
 
 
 def _auth_lock_path() -> Path:
@@ -2094,6 +2131,7 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
+        "free": "opencode-free", "opencode_free": "opencode-free",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
@@ -2162,7 +2200,29 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
 
-    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
+    # Scope-aware key reads: under multiplex a secondary profile's API keys
+    # live only in its secret scope, not os.environ — a bare getenv here
+    # would find nothing and auto-resolution would report "No LLM provider
+    # configured" for every secondary profile (same class as #86905).
+    # Catch ONLY ImportError: any other failure inside auxiliary_client must
+    # propagate — silently falling back to os.getenv would reintroduce the
+    # very fail-open this PR removes, with zero trace.
+    try:
+        from agent.auxiliary_client import _scoped_key_env
+    except ImportError:
+        logger.warning(
+            "agent.auxiliary_client unavailable (%s); provider auto-detection "
+            "will read keys from the process environment only — under "
+            "multiplex, secondary profiles may report 'No LLM provider'.",
+            "import failed",
+        )
+
+        def _scoped_key_env(name: str) -> str:
+            return os.getenv(name) or ""
+
+    if has_usable_secret(_scoped_key_env("OPENAI_API_KEY")) or has_usable_secret(
+        _scoped_key_env("OPENROUTER_API_KEY")
+    ):
         return "openrouter"
 
     # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
@@ -2205,7 +2265,7 @@ def resolve_provider(
         if pid in {"copilot", "lmstudio"}:
             continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(_scoped_key_env(env_var)):
                 # An exported API key now wins over a logged-in OAuth provider
                 # (the #29285 fix). Surface that so a user who deliberately uses
                 # OAuth but has a stale key in ~/.hermes/.env isn't silently
@@ -3343,8 +3403,10 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
         except Exception:
             pass
 
+    from hermes_cli.cli_output import line_input
+
     try:
-        raw = input("Spotify Client ID: ").strip()
+        raw = line_input("Spotify Client ID: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         raise SystemExit("Spotify setup cancelled.")
@@ -6681,6 +6743,11 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
 _NOUS_AUTH_STATUS_CACHE_TTL = 15.0  # seconds
 _nous_auth_status_cache: Optional[Tuple[float, str, Optional[float], Dict[str, Any]]] = None
 
+# mtime-keyed memo for _load_global_auth_store(): (path, mtime_ns, store).
+# Same invalidation contract as _nous_auth_status_cache — the global auth
+# file changes only when a global-scope auth write touches it.
+_global_auth_store_cache: Optional[Tuple[str, int, Dict[str, Any]]] = None
+
 
 def _auth_file_cache_key() -> Tuple[str, Optional[float]]:
     auth_file = _auth_file_path()
@@ -7037,6 +7104,25 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
+
+    # Keyless providers (opencode-free) are served anonymously: no credential
+    # exists, so every install counts as configured/logged in. Derived from
+    # the HermesOverlay keyless flag — the same source the provider catalog
+    # and GUI contract tests use.
+    try:
+        from hermes_cli.providers import HERMES_OVERLAYS
+        _overlay = HERMES_OVERLAYS.get(provider_id)
+    except Exception:
+        _overlay = None
+    if _overlay is not None and getattr(_overlay, "keyless", False):
+        return {
+            "configured": True,
+            "provider": provider_id,
+            "name": pconfig.name,
+            "key_source": "keyless",
+            "base_url": pconfig.inference_base_url,
+            "logged_in": True,
+        }
 
     api_key = ""
     key_source = ""
@@ -7566,6 +7652,7 @@ def _prompt_model_selection(
     If *unavailable_models* is provided, those models are shown grayed out
     and unselectable, with an upgrade link to *portal_url*.
     """
+    from hermes_cli.cli_output import line_input
     from hermes_cli.models import (
         _format_price_per_mtok,
         compute_sale_discount,
@@ -7782,7 +7869,7 @@ def _prompt_model_selection(
             return _confirmed_selection(ordered[idx])
         elif idx == len(ordered):
             try:
-                custom = input("Enter model name: ").strip()
+                custom = line_input("Enter model name: ").strip()
             except (EOFError, KeyboardInterrupt):
                 return None
             return _confirmed_selection(custom) if custom else None
@@ -7826,7 +7913,7 @@ def _prompt_model_selection(
             if 1 <= idx <= n:
                 return _confirmed_selection(ordered[idx - 1])
             elif idx == n + 1:
-                custom = input("Enter model name: ").strip()
+                custom = line_input("Enter model name: ").strip()
                 return _confirmed_selection(custom) if custom else None
             elif idx == n + 2:
                 return None
