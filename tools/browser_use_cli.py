@@ -242,27 +242,63 @@ def _hermes_ensure_own_tab():
                 _restore_recorded_session()
 
     if not _pinned:
+        _dedicated_supported = False
         try:
-            # Force a fresh target: new_tab() would reuse a blank current tab,
-            # which is exactly the tab a sibling daemon may also hold.
-            _pinned = cdp("Target.createTarget", url="about:blank").get("targetId")
+            from browser_harness import daemon as _daemon
+            _attach_code = getattr(
+                getattr(_daemon.Daemon, "attach_first_page", None), "__code__", None
+            )
+            _dedicated_supported = bool(
+                _attach_code and "dedicated_target_id" in _attach_code.co_names
+            )
         except Exception:
-            _pinned = None
-        if not _pinned:
-            return  # no target was created; a later call may retry safely
-        # Persist the exact candidate before attachment. If switch_tab fails,
-        # the next call retries this ID instead of minting a replacement.
-        _write_state({
-            "pinned_target_id": _pinned,
-            "pinned_session_id": None,
-            "created_target_ids": [_pinned],
-        })
-        try:
-            _pinned_session = switch_tab(_pinned)
-        except Exception as _exc:
-            raise RuntimeError(
-                "Hermes initial pinned tab attach failed; candidate retained for retry"
-            ) from _exc
+            pass
+
+        if _dedicated_supported:
+            try:
+                _current_tab = globals().get("current_tab")
+                _dedicated = _current_tab() if callable(_current_tab) else {}
+                _pinned = (
+                    _dedicated.get("targetId") or _dedicated.get("target_id")
+                    if isinstance(_dedicated, dict) else None
+                )
+                _pinned_session = (
+                    _send({"meta": "session"}).get("session_id")
+                    if callable(_send) else None
+                )
+                if not (_pinned and _pinned_session):
+                    raise RuntimeError("dedicated target/session unavailable")
+                _write_state({
+                    "pinned_target_id": _pinned,
+                    "pinned_session_id": _pinned_session,
+                    "created_target_ids": [_pinned],
+                })
+            except Exception as _exc:
+                raise RuntimeError(
+                    "Hermes named-daemon dedicated target adoption failed; refusing replacement"
+                ) from _exc
+        else:
+            try:
+                # Older harnesses may attach named daemons to a sibling's first
+                # shared page. Force a fresh target in that compatibility path.
+                _pinned = cdp("Target.createTarget", url="about:blank").get("targetId")
+            except Exception:
+                _pinned = None
+            if not _pinned:
+                return  # no target was created; a later call may retry safely
+            # Persist the exact candidate before attachment. If switch_tab fails,
+            # the next call retries this ID instead of minting a replacement.
+            _write_state({
+                "pinned_target_id": _pinned,
+                "pinned_session_id": None,
+                "created_target_ids": [_pinned],
+            })
+            try:
+                _pinned_session = switch_tab(_pinned)
+            except Exception as _exc:
+                raise RuntimeError(
+                    "Hermes initial pinned tab attach failed; candidate retained for retry"
+                ) from _exc
 
     if not _pinned:
         return  # defensive; ownership code above either pins or returns

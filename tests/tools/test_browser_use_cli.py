@@ -1276,6 +1276,64 @@ class TestOwnTabPreamble:
         assert creates == ["candidate-pin"]
         assert json.loads(marker.read_text())["pinned_target_id"] == "candidate-pin"
 
+    def test_supported_named_daemon_adopts_its_dedicated_target(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+
+        class FakeDaemon:
+            dedicated_target_id = "feature-marker"
+
+            async def attach_first_page(self):
+                return self.dedicated_target_id
+
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        setattr(harness, "daemon", SimpleNamespace(Daemon=FakeDaemon))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        current = {"targetId": "daemon-dedicated", "sessionId": "daemon-session"}
+        creates = []
+
+        def fake_send(request):
+            if request.get("meta") == "session":
+                return {"session_id": current["sessionId"]}
+            return {}
+
+        def fake_current_tab():
+            return {"targetId": current["targetId"]}
+
+        monkeypatch.setitem(fake_current_tab.__globals__, "_send", fake_send)
+
+        def fake_cdp(method, session_id=None, **params):
+            if method == "Target.createTarget":
+                creates.append("unexpected")
+                return {"targetId": "unexpected"}
+            return {"success": True}
+
+        namespace = {
+            "cdp": fake_cdp,
+            "switch_tab": lambda _target: "unexpected-session",
+            "current_tab": fake_current_tab,
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        state = json.loads(marker.read_text())
+        assert creates == []
+        assert state == {
+            "created_target_ids": ["daemon-dedicated"],
+            "pinned_session_id": "daemon-session",
+            "pinned_target_id": "daemon-dedicated",
+        }
+
     def test_preamble_is_valid_python(self):
         import ast
 
