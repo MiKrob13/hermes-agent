@@ -43,7 +43,7 @@ _OWN_TAB_PREAMBLE = """\
 # hermes: pin this named session and reap only targets this daemon recorded
 
 def _hermes_ensure_own_tab():
-    import json as _json, os as _os, tempfile as _tf
+    import glob as _glob, json as _json, os as _os, tempfile as _tf
     _name = _os.environ.get("BU_NAME", "default")
     try:
         # Key the marker by the daemon's pid so a daemon restart (which
@@ -53,13 +53,14 @@ def _hermes_ensure_own_tab():
     except Exception:
         _dpid = "0"
     _uid = _os.getuid() if hasattr(_os, "getuid") else 0
-    _marker = _os.path.join(
-        _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
+    _marker_prefix = _os.path.join(
+        _tf.gettempdir(), "hermes-bu-owntab-%s-%s" % (_uid, _name)
     )
+    _marker = _marker_prefix + "-" + _dpid
 
-    def _read_state():
+    def _read_marker(_path):
         try:
-            with open(_marker, "r", encoding="utf-8") as _handle:
+            with open(_path, "r", encoding="utf-8") as _handle:
                 _state = _json.load(_handle)
             if isinstance(_state, dict):
                 return _state
@@ -67,12 +68,15 @@ def _hermes_ensure_own_tab():
             pass
         return {}
 
-    def _write_state(_state):
-        _tmp = _marker + ".tmp-%s" % _os.getpid()
+    def _read_state():
+        return _read_marker(_marker)
+
+    def _write_marker(_path, _state):
+        _tmp = _path + ".tmp-%s" % _os.getpid()
         try:
             with open(_tmp, "w", encoding="utf-8") as _handle:
                 _json.dump(_state, _handle, sort_keys=True)
-            _os.replace(_tmp, _marker)
+            _os.replace(_tmp, _path)
         except OSError as _exc:
             try:
                 _os.unlink(_tmp)
@@ -81,6 +85,9 @@ def _hermes_ensure_own_tab():
             raise RuntimeError(
                 "Hermes own-tab marker write failed; refusing untracked browser ownership"
             ) from _exc
+
+    def _write_state(_state):
+        _write_marker(_marker, _state)
 
     def _helper_send():
         try:
@@ -100,6 +107,52 @@ def _hermes_ensure_own_tab():
         return None
 
     _state = _read_state()
+    _current_pin = _state.get("pinned_target_id")
+
+    def _pid_alive(_value):
+        try:
+            _pid = int(_value)
+            if _pid <= 0:
+                return False
+            _os.kill(_pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    # A dead daemon never gets another call, so its recorded extras (including
+    # its now-retired pin) would otherwise survive forever. Reap only exact IDs
+    # from marker files whose daemon PID is no longer alive. No target scan.
+    for _retired_marker in _glob.glob(_marker_prefix + "-*"):
+        if _retired_marker == _marker or ".tmp-" in _retired_marker:
+            continue
+        _retired_pid = _retired_marker.rsplit("-", 1)[-1]
+        if _pid_alive(_retired_pid):
+            continue
+        _retired_state = _read_marker(_retired_marker)
+        _retired_ids = _retired_state.get("created_target_ids")
+        if not isinstance(_retired_ids, list):
+            _retired_ids = []
+        _retired_remaining = []
+        for _target_id in list(dict.fromkeys(_retired_ids)):
+            if not _target_id or _target_id == _current_pin:
+                continue
+            try:
+                _closed = cdp("Target.closeTarget", targetId=_target_id)
+                if isinstance(_closed, dict) and _closed.get("success") is False:
+                    _retired_remaining.append(_target_id)
+            except Exception:
+                _retired_remaining.append(_target_id)
+        if _retired_remaining:
+            _retired_state["created_target_ids"] = _retired_remaining
+            _write_marker(_retired_marker, _retired_state)
+        else:
+            try:
+                _os.unlink(_retired_marker)
+            except FileNotFoundError:
+                pass
+
     _pinned = _state.get("pinned_target_id")
     _pinned_session = _state.get("pinned_session_id")
     _send = _helper_send()

@@ -961,6 +961,72 @@ class TestOwnTabPreamble:
         assert ("switch", "pin") not in events
         assert ("set_session", "pin", "migrated-pin-session") in events
 
+    def test_retired_daemon_targets_are_reaped_by_recorded_id(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        current_marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        current_marker.write_text(json.dumps({
+            "pinned_target_id": "current-pin",
+            "pinned_session_id": "current-session",
+            "created_target_ids": ["current-pin"],
+        }))
+        retired_marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-999999"
+        retired_marker.write_text(json.dumps({
+            "pinned_target_id": "retired-pin",
+            "pinned_session_id": "retired-session",
+            "created_target_ids": ["retired-pin", "retired-extra"],
+        }))
+        active_marker = tmp_path / (
+            f"hermes-bu-owntab-{os.getuid()}-r7k2-{os.getpid()}"
+        )
+        active_marker.write_text(json.dumps({
+            "pinned_target_id": "other-live-pin",
+            "pinned_session_id": "other-live-session",
+            "created_target_ids": ["other-live-pin", "other-live-extra"],
+        }))
+        closed = []
+
+        def fake_cdp(method, session_id=None, **params):
+            if method == "Target.closeTarget":
+                closed.append(params["targetId"])
+            return {"success": True}
+
+        def fake_send(request):
+            if request.get("meta") == "session":
+                return {"session_id": "current-session"}
+            return {}
+
+        def fake_current_tab():
+            return {"targetId": "current-pin"}
+
+        monkeypatch.setitem(fake_current_tab.__globals__, "_send", fake_send)
+        namespace = {
+            "cdp": fake_cdp,
+            "switch_tab": lambda _target: "unused",
+            "current_tab": fake_current_tab,
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        assert set(closed) == {"retired-pin", "retired-extra"}
+        assert "current-pin" not in closed
+        assert "other-live-pin" not in closed
+        assert "other-live-extra" not in closed
+        assert active_marker.exists()
+        assert not retired_marker.exists()
+        assert json.loads(current_marker.read_text())["pinned_target_id"] == "current-pin"
+
     def test_preamble_is_valid_python(self):
         import ast
 
