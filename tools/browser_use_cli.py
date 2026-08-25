@@ -10,7 +10,9 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,14 +73,36 @@ def _hermes_ensure_own_tab():
             with open(_tmp, "w", encoding="utf-8") as _handle:
                 _json.dump(_state, _handle, sort_keys=True)
             _os.replace(_tmp, _marker)
-        except OSError:
+        except OSError as _exc:
             try:
                 _os.unlink(_tmp)
             except OSError:
                 pass
+            raise RuntimeError(
+                "Hermes own-tab marker write failed; refusing untracked browser ownership"
+            ) from _exc
+
+    def _helper_send():
+        try:
+            from browser_harness import helpers as _helpers
+            _send = getattr(_helpers, "_send", None)
+            if callable(_send):
+                return _send
+        except Exception:
+            pass
+        for _helper_name in ("current_tab", "switch_tab", "new_tab"):
+            _helper = globals().get(_helper_name)
+            while callable(_helper):
+                _send = getattr(_helper, "__globals__", {}).get("_send")
+                if callable(_send):
+                    return _send
+                _helper = getattr(_helper, "__wrapped__", None)
+        return None
 
     _state = _read_state()
     _pinned = _state.get("pinned_target_id")
+    _pinned_session = _state.get("pinned_session_id")
+    _send = _helper_send()
     if _pinned:
         try:
             _current_tab = globals().get("current_tab")
@@ -87,13 +111,54 @@ def _hermes_ensure_own_tab():
                 _current.get("targetId") or _current.get("target_id")
                 if isinstance(_current, dict) else None
             )
-            if _current_id != _pinned:
-                switch_tab(_pinned)
         except Exception:
-            try:
-                switch_tab(_pinned)
-            except Exception:
-                _pinned = None
+            _current_id = None
+        if _current_id == _pinned:
+            if callable(_send):
+                try:
+                    _pinned_session = _send({"meta": "session"}).get("session_id") or _pinned_session
+                except Exception:
+                    pass
+        else:
+            if not _pinned_session:
+                # One-time migration for markers written before session IDs
+                # were persisted. Never mint a replacement target; attach to
+                # the exact recorded pin once, then reuse that session forever.
+                try:
+                    _pinned_session = switch_tab(_pinned)
+                except Exception as _exc:
+                    raise RuntimeError(
+                        "Hermes legacy pinned tab migration failed; refusing replacement"
+                    ) from _exc
+            elif not callable(_send):
+                raise RuntimeError(
+                    "Hermes pinned tab cannot be restored safely: helper IPC unavailable"
+                )
+            else:
+                try:
+                    _send({
+                        "meta": "set_session",
+                        "session_id": _pinned_session,
+                        "target_id": _pinned,
+                    })
+                    # Probe the exact recorded session. An explicit session_id makes
+                    # the daemon fail rather than auto-attach some other first page.
+                    _send({
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": "1", "returnByValue": True},
+                        "session_id": _pinned_session,
+                    })
+                    _current = _current_tab() if callable(_current_tab) else {}
+                    _current_id = (
+                        _current.get("targetId") or _current.get("target_id")
+                        if isinstance(_current, dict) else None
+                    )
+                    if _current_id != _pinned:
+                        raise RuntimeError("daemon did not return to recorded target")
+                except Exception as _exc:
+                    raise RuntimeError(
+                        "Hermes pinned tab restore failed; refusing to replace or close it"
+                    ) from _exc
 
     if not _pinned:
         try:
@@ -101,9 +166,10 @@ def _hermes_ensure_own_tab():
             # which is exactly the tab a sibling daemon may also hold.
             _pinned = cdp("Target.createTarget", url="about:blank").get("targetId")
             if _pinned:
-                switch_tab(_pinned)
+                _pinned_session = switch_tab(_pinned)
         except Exception:
             _pinned = None
+            _pinned_session = None
 
     if not _pinned:
         return  # retry pinning on the next call; never leave a false marker
@@ -111,17 +177,23 @@ def _hermes_ensure_own_tab():
     _created = _state.get("created_target_ids")
     if not isinstance(_created, list):
         _created = []
+    _remaining = [_pinned]
     for _target_id in list(dict.fromkeys(_created)):
         if not _target_id or _target_id == _pinned:
             continue
         try:
-            cdp("Target.closeTarget", targetId=_target_id)
+            _closed = cdp("Target.closeTarget", targetId=_target_id)
+            if isinstance(_closed, dict) and _closed.get("success") is False:
+                _remaining.append(_target_id)
         except Exception:
-            pass  # already closed/stale is harmless; ownership remains exact
+            # Retain the exact ownership record so a transient close failure is
+            # retried on the next serialized call rather than leaked forever.
+            _remaining.append(_target_id)
 
     _state = {
         "pinned_target_id": _pinned,
-        "created_target_ids": [_pinned],
+        "pinned_session_id": _pinned_session,
+        "created_target_ids": _remaining,
     }
     _write_state(_state)
 
@@ -141,25 +213,44 @@ def _hermes_ensure_own_tab():
             _latest["created_target_ids"] = _ids
             _write_state(_latest)
 
-    # Record explicit raw Target.createTarget calls made by model code.
+    # Record target creation at CDP return time, before new_tab can fail while
+    # switching or navigating. Keep the helper's public keyword signature.
     _original_cdp = globals().get("cdp")
     if callable(_original_cdp):
-        def _hermes_cdp(_method, *args, **kwargs):
-            _result = _original_cdp(_method, *args, **kwargs)
-            if _method == "Target.createTarget" and isinstance(_result, dict):
+        def _hermes_cdp(method, session_id=None, **params):
+            _result = _original_cdp(method, session_id=session_id, **params)
+            if method == "Target.createTarget" and isinstance(_result, dict):
                 _record_created_target(_result.get("targetId"))
             return _result
         globals()["cdp"] = _hermes_cdp
 
-    # browser_harness.helpers.new_tab has its own module globals, so wrap its
-    # return value separately instead of assuming the cdp wrapper sees it.
-    _original_new_tab = globals().get("new_tab")
-    if callable(_original_new_tab):
-        def _hermes_new_tab(*args, **kwargs):
-            _target = _original_new_tab(*args, **kwargs)
-            _record_created_target(_target)
-            return _target
-        globals()["new_tab"] = _hermes_new_tab
+        # browser_harness.run exposes traced wrappers, while helper_new_tab
+        # resolves cdp from browser_harness.helpers. Patch the module binding
+        # directly so creation is recorded before switch/navigation. In unit
+        # fakes, walk __wrapped__ to the original function globals.
+        _helper_cdp_patched = False
+        try:
+            from browser_harness import helpers as _helpers
+            _original_helper_cdp = getattr(_helpers, "cdp", None)
+            if callable(_original_helper_cdp):
+                def _hermes_helper_cdp(method, session_id=None, **params):
+                    _result = _original_helper_cdp(method, session_id=session_id, **params)
+                    if method == "Target.createTarget" and isinstance(_result, dict):
+                        _record_created_target(_result.get("targetId"))
+                    return _result
+                _helpers.cdp = _hermes_helper_cdp
+                _helper_cdp_patched = True
+        except Exception:
+            pass
+
+        if not _helper_cdp_patched:
+            _original_new_tab = globals().get("new_tab")
+            _unwrapped_new_tab = _original_new_tab
+            while callable(getattr(_unwrapped_new_tab, "__wrapped__", None)):
+                _unwrapped_new_tab = _unwrapped_new_tab.__wrapped__
+            _helper_globals = getattr(_unwrapped_new_tab, "__globals__", {})
+            if isinstance(_helper_globals, dict) and _helper_globals.get("cdp") is _original_cdp:
+                _helper_globals["cdp"] = _hermes_cdp
 
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
@@ -169,6 +260,83 @@ _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
+
+
+@contextmanager
+def _session_exec_lock(
+    session: str,
+    timeout_s: float,
+    *,
+    lock_path: Optional[Path] = None,
+):
+    """Serialize processes sharing one Browser Use daemon name.
+
+    The daemon holds one mutable current target/session, and the ownership
+    marker is a read/modify/write ledger. OS locks release automatically when a
+    caller dies, unlike lock directories or PID sentinels.
+    """
+    if not session:
+        yield
+        return
+    if lock_path is None:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        lock_path = Path(tempfile.gettempdir()) / (
+            f"hermes-bu-call-{uid}-{session}.lock"
+        )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    acquired = False
+    deadline = time.monotonic() + max(float(timeout_s), 0.0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"browser session {session!r} is busy in another process"
+                        )
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"browser session {session!r} is busy in another process"
+                        )
+                    time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -722,15 +890,18 @@ def browser_exec(
 
     started = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
+        with _session_exec_lock(session or "default", timeout):
+            proc = subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                **popen_extra,
+            )
+    except TimeoutError as e:
+        return tool_error(str(e))
     except subprocess.TimeoutExpired:
         return tool_error(
             f"browser-use exec timed out after {timeout}s. The daemon may "
