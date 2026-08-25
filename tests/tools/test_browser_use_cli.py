@@ -512,6 +512,93 @@ class TestOwnTabPreamble:
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
         assert "sentinel:unset" in result["output"]
 
+    def test_preamble_records_and_closes_only_daemon_owned_extras(self, tmp_path, monkeypatch):
+        """A shared-browser daemon keeps its pinned tab, records targets it
+        creates, and closes those exact extras on the next call without a
+        Target.getTargets scan."""
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+
+        events = []
+        created = iter(("pinned-1", "extra-1"))
+        current = {"targetId": None}
+
+        def fake_cdp(method, **params):
+            assert method != "Target.getTargets"
+            if method == "Target.createTarget":
+                target_id = next(created)
+                events.append(("create", target_id))
+                return {"targetId": target_id}
+            if method == "Target.closeTarget":
+                events.append(("close", params["targetId"]))
+                return {"success": True}
+            return {}
+
+        def fake_switch_tab(target_id):
+            events.append(("switch", target_id))
+            current["targetId"] = target_id
+
+        def fake_current_tab():
+            return dict(current)
+
+        def fake_new_tab(_url="about:blank"):
+            target_id = fake_cdp("Target.createTarget", url="about:blank")["targetId"]
+            fake_switch_tab(target_id)
+            return target_id
+
+        first = {
+            "cdp": fake_cdp,
+            "switch_tab": fake_switch_tab,
+            "current_tab": fake_current_tab,
+            "new_tab": fake_new_tab,
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, first)
+        assert first["new_tab"]("https://example.com") == "extra-1"
+
+        marker = next(tmp_path.glob("hermes-bu-owntab-*"))
+        assert json.loads(marker.read_text()) == {
+            "pinned_target_id": "pinned-1",
+            "created_target_ids": ["pinned-1", "extra-1"],
+        }
+
+        events.clear()
+        second = {
+            "cdp": fake_cdp,
+            "switch_tab": fake_switch_tab,
+            "current_tab": fake_current_tab,
+            "new_tab": fake_new_tab,
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, second)
+
+        assert ("switch", "pinned-1") in events
+        assert ("close", "extra-1") in events
+        assert ("close", "pinned-1") not in events
+        assert json.loads(marker.read_text()) == {
+            "pinned_target_id": "pinned-1",
+            "created_target_ids": ["pinned-1"],
+        }
+
+        # A later call already attached to the pinned target pays one
+        # current-tab check but must not create another CDP attachment.
+        events.clear()
+        third = {
+            "cdp": fake_cdp,
+            "switch_tab": fake_switch_tab,
+            "current_tab": fake_current_tab,
+            "new_tab": fake_new_tab,
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, third)
+        assert not [event for event in events if event[0] in {"create", "switch", "close"}]
+
     def test_preamble_is_valid_python(self):
         import ast
 
@@ -780,6 +867,13 @@ class TestSkillTextDescription:
         for helper in ("new_tab(", "page_info()", "js(", "fill_input(",
                        "click_at_xy(", "capture_screenshot()", "cdp("):
             assert helper in bu_cli._HELPERS_DIGEST
+
+    def test_digest_requires_tab_reuse_after_first_navigation(self):
+        digest = bu_cli._HELPERS_DIGEST
+        assert "Reuse your tab" in digest
+        assert "goto_url(url)` for every navigation after it" in digest
+        assert 'cdp("Target.closeTarget", targetId=…)' in digest
+        assert "Never close the browser" in digest
 
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]

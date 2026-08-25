@@ -33,19 +33,19 @@ _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
 # first existing page at startup, so two fresh named daemons can land on the
-# SAME tab; steering this daemon onto a tab it created keeps concurrent named
-# sessions from clobbering each other before their first new_tab(). Runs
-# once per daemon (marker file keyed by BU_NAME under the harness runtime
-# state), costs one IPC round-trip on later calls.
+# SAME tab. Each daemon records the tab it pins plus any later target IDs it
+# creates through the advertised new_tab()/cdp() helpers. On the next call it
+# returns to the pinned tab and closes only those recorded extras — never a
+# Target.getTargets scan, and never the pinned tab.
 _OWN_TAB_PREAMBLE = """\
-# hermes: pin this named session to its own tab (once per daemon process)
+# hermes: pin this named session and reap only targets this daemon recorded
+
 def _hermes_ensure_own_tab():
-    import os as _os, tempfile as _tf
+    import json as _json, os as _os, tempfile as _tf
     _name = _os.environ.get("BU_NAME", "default")
     try:
         # Key the marker by the daemon's pid so a daemon restart (which
-        # re-attaches to the first shared page) re-pins automatically,
-        # while agent-driven tab switches mid-session are left alone.
+        # re-attaches to the first shared page) re-pins automatically.
         from browser_harness import _ipc as _bipc
         _dpid = _bipc.pid_path(_name).read_text().strip() or "0"
     except Exception:
@@ -54,20 +54,113 @@ def _hermes_ensure_own_tab():
     _marker = _os.path.join(
         _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
     )
-    if _os.path.exists(_marker):
-        return
-    try:
-        # Force a fresh target: new_tab() would REUSE a blank current tab,
-        # which is exactly the tab a sibling daemon may also hold.
-        _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
-        if _tid:
-            switch_tab(_tid)
-    except Exception:
-        pass  # best-effort: worst case is pre-fix behavior
-    try:
-        open(_marker, "w").close()
-    except OSError:
-        pass
+
+    def _read_state():
+        try:
+            with open(_marker, "r", encoding="utf-8") as _handle:
+                _state = _json.load(_handle)
+            if isinstance(_state, dict):
+                return _state
+        except Exception:
+            pass
+        return {}
+
+    def _write_state(_state):
+        _tmp = _marker + ".tmp-%s" % _os.getpid()
+        try:
+            with open(_tmp, "w", encoding="utf-8") as _handle:
+                _json.dump(_state, _handle, sort_keys=True)
+            _os.replace(_tmp, _marker)
+        except OSError:
+            try:
+                _os.unlink(_tmp)
+            except OSError:
+                pass
+
+    _state = _read_state()
+    _pinned = _state.get("pinned_target_id")
+    if _pinned:
+        try:
+            _current_tab = globals().get("current_tab")
+            _current = _current_tab() if callable(_current_tab) else {}
+            _current_id = (
+                _current.get("targetId") or _current.get("target_id")
+                if isinstance(_current, dict) else None
+            )
+            if _current_id != _pinned:
+                switch_tab(_pinned)
+        except Exception:
+            try:
+                switch_tab(_pinned)
+            except Exception:
+                _pinned = None
+
+    if not _pinned:
+        try:
+            # Force a fresh target: new_tab() would reuse a blank current tab,
+            # which is exactly the tab a sibling daemon may also hold.
+            _pinned = cdp("Target.createTarget", url="about:blank").get("targetId")
+            if _pinned:
+                switch_tab(_pinned)
+        except Exception:
+            _pinned = None
+
+    if not _pinned:
+        return  # retry pinning on the next call; never leave a false marker
+
+    _created = _state.get("created_target_ids")
+    if not isinstance(_created, list):
+        _created = []
+    for _target_id in list(dict.fromkeys(_created)):
+        if not _target_id or _target_id == _pinned:
+            continue
+        try:
+            cdp("Target.closeTarget", targetId=_target_id)
+        except Exception:
+            pass  # already closed/stale is harmless; ownership remains exact
+
+    _state = {
+        "pinned_target_id": _pinned,
+        "created_target_ids": [_pinned],
+    }
+    _write_state(_state)
+
+    def _record_created_target(_target):
+        if isinstance(_target, dict):
+            _target = _target.get("targetId") or _target.get("target_id")
+        if not _target or _target == _pinned:
+            return
+        _latest = _read_state()
+        if _latest.get("pinned_target_id") != _pinned:
+            return
+        _ids = _latest.get("created_target_ids")
+        if not isinstance(_ids, list):
+            _ids = [_pinned]
+        if _target not in _ids:
+            _ids.append(_target)
+            _latest["created_target_ids"] = _ids
+            _write_state(_latest)
+
+    # Record explicit raw Target.createTarget calls made by model code.
+    _original_cdp = globals().get("cdp")
+    if callable(_original_cdp):
+        def _hermes_cdp(_method, *args, **kwargs):
+            _result = _original_cdp(_method, *args, **kwargs)
+            if _method == "Target.createTarget" and isinstance(_result, dict):
+                _record_created_target(_result.get("targetId"))
+            return _result
+        globals()["cdp"] = _hermes_cdp
+
+    # browser_harness.helpers.new_tab has its own module globals, so wrap its
+    # return value separately instead of assuming the cdp wrapper sees it.
+    _original_new_tab = globals().get("new_tab")
+    if callable(_original_new_tab):
+        def _hermes_new_tab(*args, **kwargs):
+            _target = _original_new_tab(*args, **kwargs)
+            _record_created_target(_target)
+            return _target
+        globals()["new_tab"] = _hermes_new_tab
+
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
@@ -751,7 +844,10 @@ _skill_text_fetched = False
 # first-call reliability of the helper names without the 7.7KB dump.
 _HELPERS_DIGEST = (
     "\n\nHELPERS (pre-imported): new_tab(url) opens/navigates (use for the "
-    "FIRST navigation), goto_url(url) navigates the current tab, "
+    "FIRST navigation), goto_url(url) navigates the current tab. Reuse your "
+    "tab: `new_tab(url)` for the first navigation only, `goto_url(url)` for "
+    "every navigation after it. Close any extra target you open with "
+    "`cdp(\"Target.closeTarget\", targetId=…)`. Never close the browser. "
     "wait_for_load() after navigation, page_info() summarizes the current "
     "page state, js(expr) evaluates a JS expression and returns its value "
     "(js('document.title'); wrap function bodies as js('(() => {...})()') — "
