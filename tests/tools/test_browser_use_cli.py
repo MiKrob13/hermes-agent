@@ -1027,6 +1027,48 @@ class TestOwnTabPreamble:
         assert not retired_marker.exists()
         assert json.loads(current_marker.read_text())["pinned_target_id"] == "current-pin"
 
+    def test_windows_retired_pid_probe_never_calls_os_kill(self, tmp_path, monkeypatch):
+        import subprocess
+        import sys
+
+        script = tmp_path / "windows_pid_probe.py"
+        script.write_text(
+            "import json, os, sys, tempfile\n"
+            "from types import ModuleType, SimpleNamespace\n"
+            f"root = {str(tmp_path)!r}\n"
+            "os.name = 'nt'\n"
+            "if hasattr(os, 'getuid'): del os.getuid\n"
+            "os.kill = lambda *_a: (_ for _ in ()).throw(AssertionError('unsafe os.kill'))\n"
+            "tempfile.gettempdir = lambda: root\n"
+            "class P:\n"
+            "  def read_text(self): return '4242'\n"
+            "h=ModuleType('browser_harness'); h._ipc=SimpleNamespace(pid_path=lambda _n:P())\n"
+            "sys.modules['browser_harness']=h\n"
+            "g=ModuleType('glob'); g.glob=lambda _p:[os.path.join(root,'hermes-bu-owntab-0-r7k2-4242'),os.path.join(root,'hermes-bu-owntab-0-r7k2-999999')]\n"
+            "sys.modules['glob']=g\n"
+            "class U:\n"
+            "  def __init__(self): self.value=0\n"
+            "class K:\n"
+            "  def OpenProcess(self,*_a): return 1\n"
+            "  def GetExitCodeProcess(self,_h,c): c.value=259; return 1\n"
+            "  def CloseHandle(self,*_a): return 1\n"
+            "c=ModuleType('ctypes'); c.windll=SimpleNamespace(kernel32=K()); c.c_ulong=U; c.byref=lambda v:v\n"
+            "sys.modules['ctypes']=c\n"
+            "prefix=os.path.join(root,'hermes-bu-owntab-0-r7k2-')\n"
+            "open(prefix+'4242','w').write(json.dumps({'pinned_target_id':'current-pin','pinned_session_id':'current-session','created_target_ids':['current-pin']}))\n"
+            "open(prefix+'999999','w').write(json.dumps({'pinned_target_id':'live-pin','created_target_ids':['live-pin']}))\n"
+            "def send(r): return {'session_id':'current-session'} if r.get('meta')=='session' else {}\n"
+            "def current_tab(): return {'targetId':'current-pin'}\n"
+            "current_tab.__globals__['_send']=send\n"
+            "ns={'cdp':lambda method,session_id=None,**params:{'success':True},'switch_tab':lambda _t:'unused','current_tab':current_tab,'new_tab':lambda _u='about:blank':'unused'}\n"
+            f"exec({bu_cli._OWN_TAB_PREAMBLE!r}, ns)\n"
+            "assert os.path.exists(prefix+'999999')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, result.stderr
+
     def test_preamble_is_valid_python(self):
         import ast
 

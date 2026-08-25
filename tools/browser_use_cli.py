@@ -114,6 +114,22 @@ def _hermes_ensure_own_tab():
             _pid = int(_value)
             if _pid <= 0:
                 return False
+            if _os.name == "nt":
+                import ctypes as _ctypes
+
+                _kernel32 = _ctypes.windll.kernel32
+                _handle = _kernel32.OpenProcess(0x1000, False, _pid)
+                if not _handle:
+                    return False
+                try:
+                    _exit_code = _ctypes.c_ulong()
+                    if not _kernel32.GetExitCodeProcess(
+                        _handle, _ctypes.byref(_exit_code)
+                    ):
+                        return False
+                    return _exit_code.value == 259  # STILL_ACTIVE
+                finally:
+                    _kernel32.CloseHandle(_handle)
             _os.kill(_pid, 0)
             return True
         except PermissionError:
