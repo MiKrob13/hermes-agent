@@ -62,11 +62,15 @@ def _hermes_ensure_own_tab():
         try:
             with open(_path, "r", encoding="utf-8") as _handle:
                 _state = _json.load(_handle)
-            if isinstance(_state, dict):
-                return _state
-        except Exception:
-            pass
-        return {}
+            if not isinstance(_state, dict):
+                raise ValueError("marker root is not an object")
+            return _state
+        except FileNotFoundError:
+            return {}
+        except Exception as _exc:
+            raise RuntimeError(
+                "Hermes own-tab marker read failed; refusing ownership replacement"
+            ) from _exc
 
     def _read_state():
         return _read_marker(_marker)
@@ -182,12 +186,47 @@ def _hermes_ensure_own_tab():
             )
         except Exception:
             _current_id = None
+        def _restore_recorded_session():
+            if not callable(_send):
+                raise RuntimeError(
+                    "Hermes pinned tab cannot be restored safely: helper IPC unavailable"
+                )
+            try:
+                _send({
+                    "meta": "set_session",
+                    "session_id": _pinned_session,
+                    "target_id": _pinned,
+                })
+                # Probe the exact recorded session. An explicit session_id makes
+                # the daemon fail rather than auto-attach some other first page.
+                _send({
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "1", "returnByValue": True},
+                    "session_id": _pinned_session,
+                })
+                _restored = _current_tab() if callable(_current_tab) else {}
+                _restored_id = (
+                    _restored.get("targetId") or _restored.get("target_id")
+                    if isinstance(_restored, dict) else None
+                )
+                if _restored_id != _pinned:
+                    raise RuntimeError("daemon did not return to recorded target")
+            except Exception as _exc:
+                raise RuntimeError(
+                    "Hermes pinned tab restore failed; refusing to replace or close it"
+                ) from _exc
+
         if _current_id == _pinned:
+            _current_session = None
             if callable(_send):
                 try:
-                    _pinned_session = _send({"meta": "session"}).get("session_id") or _pinned_session
+                    _current_session = _send({"meta": "session"}).get("session_id")
                 except Exception:
                     pass
+            if not _pinned_session:
+                _pinned_session = _current_session
+            elif _current_session != _pinned_session:
+                _restore_recorded_session()
         else:
             if not _pinned_session:
                 # One-time migration for markers written before session IDs
@@ -199,49 +238,34 @@ def _hermes_ensure_own_tab():
                     raise RuntimeError(
                         "Hermes legacy pinned tab migration failed; refusing replacement"
                     ) from _exc
-            elif not callable(_send):
-                raise RuntimeError(
-                    "Hermes pinned tab cannot be restored safely: helper IPC unavailable"
-                )
             else:
-                try:
-                    _send({
-                        "meta": "set_session",
-                        "session_id": _pinned_session,
-                        "target_id": _pinned,
-                    })
-                    # Probe the exact recorded session. An explicit session_id makes
-                    # the daemon fail rather than auto-attach some other first page.
-                    _send({
-                        "method": "Runtime.evaluate",
-                        "params": {"expression": "1", "returnByValue": True},
-                        "session_id": _pinned_session,
-                    })
-                    _current = _current_tab() if callable(_current_tab) else {}
-                    _current_id = (
-                        _current.get("targetId") or _current.get("target_id")
-                        if isinstance(_current, dict) else None
-                    )
-                    if _current_id != _pinned:
-                        raise RuntimeError("daemon did not return to recorded target")
-                except Exception as _exc:
-                    raise RuntimeError(
-                        "Hermes pinned tab restore failed; refusing to replace or close it"
-                    ) from _exc
+                _restore_recorded_session()
 
     if not _pinned:
         try:
             # Force a fresh target: new_tab() would reuse a blank current tab,
             # which is exactly the tab a sibling daemon may also hold.
             _pinned = cdp("Target.createTarget", url="about:blank").get("targetId")
-            if _pinned:
-                _pinned_session = switch_tab(_pinned)
         except Exception:
             _pinned = None
-            _pinned_session = None
+        if not _pinned:
+            return  # no target was created; a later call may retry safely
+        # Persist the exact candidate before attachment. If switch_tab fails,
+        # the next call retries this ID instead of minting a replacement.
+        _write_state({
+            "pinned_target_id": _pinned,
+            "pinned_session_id": None,
+            "created_target_ids": [_pinned],
+        })
+        try:
+            _pinned_session = switch_tab(_pinned)
+        except Exception as _exc:
+            raise RuntimeError(
+                "Hermes initial pinned tab attach failed; candidate retained for retry"
+            ) from _exc
 
     if not _pinned:
-        return  # retry pinning on the next call; never leave a false marker
+        return  # defensive; ownership code above either pins or returns
 
     _created = _state.get("created_target_ids")
     if not isinstance(_created, list):

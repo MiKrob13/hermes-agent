@@ -1069,6 +1069,213 @@ class TestOwnTabPreamble:
         )
         assert result.returncode == 0, result.stderr
 
+    def test_matching_target_with_drifted_session_restores_recorded_pair(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        marker.write_text(json.dumps({
+            "pinned_target_id": "pin",
+            "pinned_session_id": "pin-session",
+            "created_target_ids": ["pin"],
+        }))
+        current = {"targetId": "pin", "sessionId": "drift-session"}
+        events = []
+
+        def fake_send(request):
+            if request.get("meta") == "session":
+                return {"session_id": current["sessionId"]}
+            if request.get("meta") == "set_session":
+                events.append(("set_session", request["target_id"], request["session_id"]))
+                current["targetId"] = request["target_id"]
+                current["sessionId"] = request["session_id"]
+                return {"session_id": request["session_id"]}
+            if request.get("method") == "Runtime.evaluate":
+                events.append(("probe", request["session_id"]))
+                return {"result": {"value": 1}}
+            return {}
+
+        def fake_current_tab():
+            return {"targetId": current["targetId"]}
+
+        monkeypatch.setitem(fake_current_tab.__globals__, "_send", fake_send)
+        namespace = {
+            "cdp": lambda method, session_id=None, **params: {"success": True},
+            "switch_tab": lambda _target: "must-not-attach",
+            "current_tab": fake_current_tab,
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        assert ("set_session", "pin", "pin-session") in events
+        assert ("probe", "pin-session") in events
+        assert json.loads(marker.read_text())["pinned_session_id"] == "pin-session"
+
+    def test_current_marker_read_failure_is_fail_closed(self, tmp_path, monkeypatch):
+        import builtins
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        original = {
+            "pinned_target_id": "pin",
+            "pinned_session_id": "pin-session",
+            "created_target_ids": ["pin"],
+        }
+        marker.write_text(json.dumps(original))
+        real_open = builtins.open
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if str(path) == str(marker) and "r" in mode:
+                raise OSError("transient read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", failing_open)
+        creates = []
+
+        def fake_cdp(method, session_id=None, **params):
+            if method == "Target.createTarget":
+                creates.append("replacement")
+                return {"targetId": "replacement"}
+            return {"success": True}
+
+        namespace = {
+            "cdp": fake_cdp,
+            "switch_tab": lambda _target: "replacement-session",
+            "current_tab": lambda: {"targetId": "pin"},
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        with pytest.raises(RuntimeError, match="marker read"):
+            exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+        assert creates == []
+        assert json.loads(marker.read_text()) == original
+
+    def test_retired_marker_read_failure_preserves_ledger(self, tmp_path, monkeypatch):
+        import builtins
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        current = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        current.write_text(json.dumps({
+            "pinned_target_id": "pin",
+            "pinned_session_id": "pin-session",
+            "created_target_ids": ["pin"],
+        }))
+        retired = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-999999"
+        retired.write_text(json.dumps({
+            "pinned_target_id": "retired-pin",
+            "created_target_ids": ["retired-pin", "retired-extra"],
+        }))
+        real_open = builtins.open
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if str(path) == str(retired) and "r" in mode:
+                raise OSError("transient retired read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", failing_open)
+        closes = []
+
+        def fake_send(request):
+            if request.get("meta") == "session":
+                return {"session_id": "pin-session"}
+            return {}
+
+        def fake_current_tab():
+            return {"targetId": "pin"}
+
+        monkeypatch.setitem(fake_current_tab.__globals__, "_send", fake_send)
+        namespace = {
+            "cdp": lambda method, session_id=None, **params: closes.append(params.get("targetId")) or {"success": True},
+            "switch_tab": lambda _target: "unused",
+            "current_tab": fake_current_tab,
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        with pytest.raises(RuntimeError, match="marker read"):
+            exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+        assert retired.exists()
+        assert closes == []
+
+    def test_initial_pin_attach_failure_retains_candidate_for_retry(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+        import tempfile
+        from types import ModuleType, SimpleNamespace
+
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        pid_path = tmp_path / "r7k2.pid"
+        pid_path.write_text("4242")
+        harness = ModuleType("browser_harness")
+        setattr(harness, "_ipc", SimpleNamespace(pid_path=lambda _name: pid_path))
+        monkeypatch.setitem(sys.modules, "browser_harness", harness)
+        marker = tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-4242"
+        creates = []
+        attach_attempts = 0
+        current = {"targetId": "foreign"}
+
+        def fake_cdp(method, session_id=None, **params):
+            if method == "Target.createTarget":
+                target = "candidate-pin" if not creates else "replacement-pin"
+                creates.append(target)
+                return {"targetId": target}
+            return {"success": True}
+
+        def fake_switch_tab(target):
+            nonlocal attach_attempts
+            attach_attempts += 1
+            if attach_attempts == 1:
+                raise RuntimeError("transient first attach")
+            current["targetId"] = target
+            return "candidate-session"
+
+        def fake_current_tab():
+            return {"targetId": current["targetId"]}
+
+        namespace = {
+            "cdp": fake_cdp,
+            "switch_tab": fake_switch_tab,
+            "current_tab": fake_current_tab,
+            "new_tab": lambda _url="about:blank": "unused",
+        }
+        with pytest.raises(RuntimeError, match="initial pinned tab attach"):
+            exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+
+        first_state = json.loads(marker.read_text())
+        assert first_state["pinned_target_id"] == "candidate-pin"
+        assert first_state["created_target_ids"] == ["candidate-pin"]
+
+        exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+        assert creates == ["candidate-pin"]
+        assert json.loads(marker.read_text())["pinned_target_id"] == "candidate-pin"
+
     def test_preamble_is_valid_python(self):
         import ast
 
