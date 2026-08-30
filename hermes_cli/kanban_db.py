@@ -10848,17 +10848,26 @@ def _default_spawn(
     # Read the spawned profile config directly and raise only when the profile
     # asks for a larger budget, preserving intentional low env caps.
     try:
-        import yaml as _yaml_worker_budget
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
-        _cfg_path = Path(env.get("HERMES_HOME", "")) / "config.yaml"
+        _profile_home = Path(env.get("HERMES_HOME", ""))
+        _cfg_path = _profile_home / "config.yaml"
         if _cfg_path.exists():
-            _raw_cfg = _yaml_worker_budget.safe_load(_cfg_path.read_text(encoding="utf-8")) or {}
-            _agent_cfg = _raw_cfg.get("agent", {}) if isinstance(_raw_cfg, dict) else {}
+            _home_token = set_hermes_home_override(_profile_home)
+            try:
+                _profile_cfg = load_config_readonly() or {}
+            finally:
+                reset_hermes_home_override(_home_token)
+            _agent_cfg = _profile_cfg.get("agent", {}) if isinstance(_profile_cfg, dict) else {}
             _profile_max = None
             if isinstance(_agent_cfg, dict):
                 _profile_max = _agent_cfg.get("max_turns")
-            if _profile_max is None and isinstance(_raw_cfg, dict):
-                _profile_max = _raw_cfg.get("max_turns")
+            if _profile_max is None and isinstance(_profile_cfg, dict):
+                _profile_max = _profile_cfg.get("max_turns")
             if _profile_max is not None:
                 _profile_max_i = int(_profile_max)
                 try:
@@ -10868,7 +10877,7 @@ def _default_spawn(
                 if _profile_max_i > _current_max_i:
                     env["HERMES_MAX_ITERATIONS"] = str(_profile_max_i)
 
-            _model_cfg = _raw_cfg.get("model", {}) if isinstance(_raw_cfg, dict) else {}
+            _model_cfg = _profile_cfg.get("model", {}) if isinstance(_profile_cfg, dict) else {}
             _provider = ""
             if isinstance(_model_cfg, dict):
                 _provider = str(_model_cfg.get("provider") or "").strip().lower()

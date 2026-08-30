@@ -7657,6 +7657,13 @@ class AIAgent:
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
         """
+        # Fork-local Claude CLI consumes this field inside ClaudeCLIClient and
+        # translates it to `claude --effort`; it never crosses an HTTP wire.
+        if (
+            (self.provider or "").strip().lower() == "claude-cli"
+            or self._base_url_lower.startswith("claude-cli://")
+        ):
+            return True
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):

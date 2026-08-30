@@ -99,6 +99,33 @@ def test_claude_cli_client_passes_reasoning_effort(monkeypatch, tmp_path):
     assert cmd[-4:] == ["--model", "claude-opus-4-7", "--effort", "high"]
 
 
+def test_claude_cli_agent_forwards_reasoning_effort():
+    """The real agent path must carry /reasoning through to the CLI adapter."""
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        base_url="claude-cli://claude",
+        model="claude-opus-4-7",
+        provider="claude-cli",
+        reasoning_config={"enabled": True, "effort": "high"},
+        max_tokens=128000,
+        enabled_toolsets=[],
+        skip_memory=True,
+        skip_background_review=True,
+        quiet_mode=True,
+    )
+
+    kwargs = agent._build_api_kwargs(
+        [{"role": "user", "content": "Say ok"}],
+        tools_for_api=[],
+    )
+
+    assert kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
 def test_claude_cli_client_extracts_tool_calls(monkeypatch, tmp_path):
     from agent.claude_cli_client import ClaudeCLIClient
 
